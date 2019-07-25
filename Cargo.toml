@@ -1,0 +1,26 @@
+[package]
+name = "lpc11xx-async-hal"
+edition = "2018"
+version = "0.1.0"
+authors = ["Thomas Bénéteau <thomas@bitwise.me>"]
+description = "Asynchronous HAL for the NXP LPC111x/LPC11Cxx/LPC11xxL/LPC11xxXL family of Cortex-M0 microcontrollers"
+documentation = "https://docs.rs/lpc11xx-async-hal"
+repository = "https://github.com/TomCrypto/lpc11xx-async-hal"
+license = "MIT"
+readme = "README.md"
+categories = ["embedded", "hardware-support", "no-std"]
+keywords = ["arm", "cortex-m", "nxp", "async", "hal"]
+exclude = [".vscode/*"]
+
+[dependencies]
+lpc11xx = "0.1"
+
+# Until async-await no longer depends on TLS we must pull
+# in a libcore override that gives access to async await.
+
+[dependencies.core]
+package = "core-futures-stateless"
+version = "0.1.0"
+
+[features]
+rt = ["lpc11xx/rt"]
