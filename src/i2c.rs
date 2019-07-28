@@ -58,6 +58,7 @@ impl Driver {
     }
 
     /// Relinquishes ownership of the underlying peripheral.
+    #[inline]
     pub fn into_inner(self) -> I2CDevice {
         self.i2c
     }
@@ -84,6 +85,7 @@ impl Driver {
     /// Executes a single command on the bus.
     ///
     /// This is implemented as a transaction containing that single command.
+    #[inline]
     pub async fn exec_command(&mut self, command: Command<'_>) -> Result<(), Error> {
         self.exec_transaction(core::slice::from_ref(&command)).await
     }
@@ -165,12 +167,14 @@ impl Driver {
     }
 
     /// Handles an active peripheral interrupt.
+    #[inline]
     pub fn handle_interrupt(&mut self) {
         Self::handle_interrupt_impl(&self.i2c)
     }
 
     /// Equivalent to [handle_interrupt](#method.handle_interrupt) but you must
     /// guarantee that there are currently no live references to the driver.
+    #[inline]
     pub unsafe fn handle_interrupt_unchecked() {
         Self::handle_interrupt_impl(&*I2CDevice::ptr())
     }
@@ -283,16 +287,19 @@ pub struct Address(u8);
 
 impl Address {
     /// Returns the General Call address.
+    #[inline]
     pub const fn general_call() -> Self {
         Self(0b0000_0000)
     }
 
-    /// Converts a byte like `0bAAAAAAAX` into an I2C address.
+    /// Converts a byte in the form `0bAAAAAAAX` into an I2C address.
+    #[inline]
     pub const fn from_left_justified_byte(value: u8) -> Self {
         Self(value & 0b1111_1110)
     }
 
-    /// Converts a byte like `0bXAAAAAAA` into an I2C address.
+    /// Converts a byte in the form `0bXAAAAAAA` into an I2C address.
+    #[inline]
     pub const fn from_right_justified_byte(value: u8) -> Self {
         Self(value << 1)
     }
@@ -302,6 +309,7 @@ impl Address {
     /// This address may not be used for receiving data since it addresses
     /// multiple slaves simultaneously. Attempts to read using this address will
     /// result in NOT ACK errors.
+    #[inline]
     pub const fn is_general_call(self) -> bool {
         self.0 == 0b0000_0000
     }
@@ -312,6 +320,7 @@ impl Address {
     /// bus may malfunction. Only use reserved addresses in controlled
     /// environments. The General Call address is not considered a reserved
     /// address by this method.
+    #[inline]
     pub const fn is_reserved(self) -> bool {
         let masked = self.0 & 0b1111_0000;
 
@@ -319,21 +328,25 @@ impl Address {
     }
 
     /// Returns this address as a `0bAAAAAAA0` byte.
+    #[inline]
     pub const fn as_left_justified_byte(self) -> u8 {
         self.0
     }
 
     /// Returns this address as a `0b0AAAAAAA` byte.
+    #[inline]
     pub const fn as_right_justified_byte(self) -> u8 {
         self.0 >> 1
     }
 
     /// Returns the byte representing a read command for this address.
+    #[inline]
     const fn as_read_byte(self) -> u8 {
         self.0 | 0b0000_0001
     }
 
     /// Returns the byte representing a write command for this address.
+    #[inline]
     const fn as_write_byte(self) -> u8 {
         self.0
     }

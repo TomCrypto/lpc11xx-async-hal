@@ -129,17 +129,20 @@ impl Driver {
     }
 
     /// Relinquishes ownership of the underlying peripheral.
+    #[inline]
     pub fn into_inner(self) -> UARTDevice {
         self.uart
     }
 
     /// Handles an active peripheral interrupt.
+    #[inline]
     pub fn handle_interrupt(&mut self) {
         Self::handle_interrupt_impl(&self.uart)
     }
 
     /// Equivalent to [handle_interrupt](#method.handle_interrupt) but you must
     /// guarantee that there are currently no live references to the driver.
+    #[inline]
     pub unsafe fn handle_interrupt_unchecked() {
         Self::handle_interrupt_impl(&*UARTDevice::ptr())
     }
@@ -208,28 +211,34 @@ impl Driver {
         }
     }
 
+    #[inline]
     fn notify_tx_complete(uart: &RegisterBlock) {
         Self::disable_tx_interrupts(uart);
         lpc11xx::SCB::set_pendsv();
     }
 
+    #[inline]
     fn notify_rx_complete(uart: &RegisterBlock) {
         Self::disable_rx_interrupts(uart);
         lpc11xx::SCB::set_pendsv();
     }
 
+    #[inline]
     fn enable_tx_interrupts(uart: &RegisterBlock) {
         unsafe { &uart.dlm.ier }.modify(|_, w| w.threie().enable());
     }
 
+    #[inline]
     fn disable_tx_interrupts(uart: &RegisterBlock) {
         unsafe { &uart.dlm.ier }.modify(|_, w| w.threie().disable());
     }
 
+    #[inline]
     fn enable_rx_interrupts(uart: &RegisterBlock) {
         unsafe { &uart.dlm.ier }.modify(|_, w| w.rbrie().enable());
     }
 
+    #[inline]
     fn disable_rx_interrupts(uart: &RegisterBlock) {
         unsafe { &uart.dlm.ier }.modify(|_, w| w.rbrie().disable());
     }

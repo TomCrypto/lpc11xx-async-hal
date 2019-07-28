@@ -4,26 +4,35 @@ use core::task::{Context, Poll};
 use lpc11xx::adc::RegisterBlock;
 use lpc11xx::ADC as ADCDevice;
 
-// TODO: add support for start-on-timer-match for software sampling
-// don't include PIO0_2/PIO1_5 as these are known to be buggy, see
-// errata sheet: https://www.nxp.com/docs/en/errata/ES_LPC1114.pdf
+// ERRATA: https://www.nxp.com/docs/en/errata/ES_LPC111X.pdf
+//
+// The ADC peripheral has a few problems. In particular, hardware triggering on
+// the PIO0_2 and the PIO1_5 pins is unreliable with no workaround, so just
+// don't support them. Also, the Global Data register is unreliable in most ADC
+// modes, so just don't use it (we don't really need it in this implementation).
 
 /// Global configuration options for the ADC driver.
 #[derive(Clone, Copy, Debug)]
 pub struct Options {
-    /// Divisor such that PCLK / (divisor + 1) <= 4.5MHz.
+    /// Clock divisor to the ADC input clock (the APB clock).
+    ///
+    /// # Note
+    ///
+    /// It is required that `PCLK / (divisor + 1) <= 4.5MHz`.
     pub clock_divisor: u8,
 }
 
+/// A configurable hardware scan accuracy for the ADC.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Accuracy {
-    ThreeBits,
-    FourBits,
-    FiveBits,
-    SixBits,
-    SevenBits,
-    EightBits,
-    NineBits,
-    TenBits,
+    TenBit = 0,
+    NineBit = 1,
+    EightBit = 2,
+    SevenBit = 3,
+    SixBit = 4,
+    FiveBit = 5,
+    FourBit = 6,
+    ThreeBit = 7,
 }
 
 /// An analog channel corresponding to an analog function pin.
@@ -48,55 +57,64 @@ impl Channel {
 /// Async ADC driver for LPC11xx microcontrollers.
 pub struct Driver {
     adc: ADCDevice,
-    clock_divisor: u8,
 }
 
 impl Driver {
     /// Initialize the driver. See UM10398 25.2 for prerequisites.
     pub fn initialize(adc: ADCDevice, options: Options) -> Self {
-        Self {
-            adc,
-            clock_divisor: options.clock_divisor,
-        }
+        adc.cr.write(|w| w.clkdiv().bits(options.clock_divisor));
+        adc.inten.reset(); // get interrupts into a known state
+
+        Self { adc }
     }
 
     /// Relinquishes ownership of the underlying peripheral.
+    #[inline]
     pub fn into_inner(self) -> ADCDevice {
         self.adc
     }
 
     /// Samples an analog channel in software mode to 10-bit accuracy.
     pub async fn sample(&mut self, channel: Channel) -> VoltageRange {
-        self.adc.inten.reset();
+        let mask = channel.as_channel_mask();
+
+        self.adc
+            .inten
+            .write(|w| w.adginten().clear_bit().adinten().bits(mask));
+
+        self.adc.cr.modify(|_, w| {
+            w.sel()
+                .bits(mask)
+                .burst()
+                .swmode()
+                .clks()
+                .ten_bit()
+                .start()
+                .start()
+        });
 
         unsafe {
-            self.adc.cr.write(|w| {
-                w.sel()
-                    .bits(channel.as_channel_mask())
-                    .burst()
-                    .swmode()
-                    .clkdiv()
-                    .bits(self.clock_divisor)
-                    .start()
-                    .start()
-            });
+            ADC_CTX.status = Status::Software(channel);
         }
 
-        unsafe {
-            ADC_CTX.voltages_measured = false;
-            ADC_CTX.channel = Some(channel);
-        }
+        (MeasurementFuture.await)[channel as usize]
+    }
 
-        VoltageRange::from_adc((MeasurementFuture.await)[channel as usize])
+    /// Begins a continuous hardware scan on an arbitrary set of ADC channels.
+    #[inline]
+    pub fn scan(&mut self, channels: u8, accuracy: Accuracy) -> HardwareScan {
+        HardwareScan::new(&self.adc, channels, accuracy)
     }
 
     /// Handles an active peripheral interrupt.
+    #[inline]
     pub fn handle_interrupt(&mut self) {
         Self::handle_interrupt_impl(&self.adc)
     }
 
     /// Equivalent to [handle_interrupt](#method.handle_interrupt) but you must
     /// guarantee that there are currently no live references to the driver.
+    #[inline]
     pub unsafe fn handle_interrupt_unchecked() {
         Self::handle_interrupt_impl(&*ADCDevice::ptr())
     }
@@ -104,42 +122,76 @@ impl Driver {
     fn handle_interrupt_impl(adc: &RegisterBlock) {
         let ctx: &mut AdcContext = unsafe { &mut ADC_CTX };
 
-        let stat = adc.stat.read();
+        match ctx.status {
+            Status::Software(channel) => {
+                let register = adc.dr[channel as usize].read();
 
-        if let Some(channel) = ctx.channel {
-            let register = &adc.dr[channel as usize].read();
+                if register.done().bit_is_clear() {
+                    return; // data not available
+                }
 
-            if register.done().bit_is_set() {
-                ctx.voltages[channel as usize] = register.v_vref().bits();
-                ctx.voltages_measured = true;
+                ctx.voltages[channel as usize] =
+                    VoltageRange::from_raw(register.v_vref().bits(), Accuracy::TenBit);
 
+                // Make sure to stop the ADC conversion
                 adc.cr.modify(|_, w| w.start().stop());
-
-                lpc11xx::SCB::set_pendsv();
             }
+            Status::Hardware(mask, accuracy) => {
+                if adc.stat.read().done().bits() & mask != mask {
+                    return; // we don't have every channel yet
+                }
+
+                if mask & 0b0000_0001 != 0 {
+                    ctx.voltages[0] =
+                        VoltageRange::from_raw(adc.dr[0].read().v_vref().bits(), accuracy);
+                }
+
+                if mask & 0b0000_0010 != 0 {
+                    ctx.voltages[1] =
+                        VoltageRange::from_raw(adc.dr[1].read().v_vref().bits(), accuracy);
+                }
+
+                if mask & 0b0000_0100 != 0 {
+                    ctx.voltages[2] =
+                        VoltageRange::from_raw(adc.dr[2].read().v_vref().bits(), accuracy);
+                }
+
+                if mask & 0b0000_1000 != 0 {
+                    ctx.voltages[3] =
+                        VoltageRange::from_raw(adc.dr[3].read().v_vref().bits(), accuracy);
+                }
+
+                if mask & 0b0001_0000 != 0 {
+                    ctx.voltages[4] =
+                        VoltageRange::from_raw(adc.dr[4].read().v_vref().bits(), accuracy);
+                }
+
+                if mask & 0b0010_0000 != 0 {
+                    ctx.voltages[5] =
+                        VoltageRange::from_raw(adc.dr[5].read().v_vref().bits(), accuracy);
+                }
+
+                if mask & 0b0100_0000 != 0 {
+                    ctx.voltages[6] =
+                        VoltageRange::from_raw(adc.dr[6].read().v_vref().bits(), accuracy);
+                }
+
+                if mask & 0b1000_0000 != 0 {
+                    ctx.voltages[7] =
+                        VoltageRange::from_raw(adc.dr[7].read().v_vref().bits(), accuracy);
+                }
+            }
+            Status::Complete => {}
+        }
+
+        // Stop all ADC interrupts if we get down here
+        adc.inten.write(|w| w.adginten().clear_bit());
+
+        if let Status::Complete = ctx.status {
+            // do nothing (reverse pattern)
         } else {
-            // get the channel mask first based on the interrupt mask
-            let mask = adc.inten.read().adintenn().bits();
-
-            let done = stat.done().bits();
-            let overrun = stat.overrun().bits();
-
-            // TODO: race condition here??
-
-            if done & mask == mask && overrun & mask == 0 {
-                ctx.voltages[0] = adc.dr[0].read().v_vref().bits();
-                ctx.voltages[1] = adc.dr[1].read().v_vref().bits();
-                ctx.voltages[2] = adc.dr[2].read().v_vref().bits();
-                ctx.voltages[3] = adc.dr[3].read().v_vref().bits();
-                ctx.voltages[4] = adc.dr[4].read().v_vref().bits();
-                ctx.voltages[5] = adc.dr[5].read().v_vref().bits();
-                ctx.voltages[6] = adc.dr[6].read().v_vref().bits();
-                ctx.voltages[7] = adc.dr[7].read().v_vref().bits();
-
-                ctx.voltages_measured = true;
-
-                lpc11xx::SCB::set_pendsv();
-            }
+            ctx.status = Status::Complete;
+            lpc11xx::SCB::set_pendsv();
         }
     }
 }
@@ -150,67 +202,180 @@ impl core::fmt::Debug for Driver {
     }
 }
 
+pub struct HardwareScan<'a> {
+    adc: &'a ADCDevice,
+    accuracy: Accuracy,
+    channels: u8,
+}
+
+impl<'a> HardwareScan<'a> {
+    fn new(adc: &'a ADCDevice, channels: u8, accuracy: Accuracy) -> Self {
+        adc.inten.write(|w| w.adginten().clear_bit());
+
+        // Note: the Accuracy enum already has compatible values for the CLKS field so
+        // that we do not rely on the optimizer to have to figure this out for itself.
+
+        adc.cr.modify(|_, w| {
+            w.sel()
+                .bits(channels)
+                .burst()
+                .hwmode()
+                .clks()
+                .bits(accuracy as u8)
+                .start()
+                .stop()
+        });
+
+        Self {
+            adc,
+            accuracy,
+            channels,
+        }
+    }
+
+    /// Samples a set of analog channels simultaneously.
+    ///
+    /// # Return value
+    ///
+    /// Returns measurements for all analog channels. Measurements will be valid
+    /// for those channels that are being continuously monitored *and* are in
+    /// the channel mask passed to this method, otherwise they will be zero.
+    ///
+    /// # Panics
+    ///
+    /// This method will panic if the channels provided aren't contained in the
+    /// set of channels being scanned in this ADC hardware scan.
+    pub async fn sample(&mut self, channels: u8) -> &[VoltageRange; 8] {
+        assert_eq!(channels & self.channels, channels);
+
+        let ctx = unsafe { &mut ADC_CTX };
+
+        ctx.voltages = [VoltageRange::ground(self.accuracy); 8];
+        ctx.status = Status::Hardware(channels, self.accuracy);
+
+        self.adc
+            .inten
+            .write(|w| w.adginten().clear_bit().adinten().bits(channels));
+
+        MeasurementFuture.await
+    }
+
+    /// Samples an analog channel synchronously in a non-blocking fashion.
+    ///
+    /// # Return value
+    ///
+    /// If a measurement is available for the selected channel, returns that
+    /// measurement and clears it from the ADC peripheral. If no measurement
+    /// is available, this method will do nothing and return `None`.
+    ///
+    /// # Panics
+    ///
+    /// This method will panic if the channel provided isn't contained in the
+    /// set of channels being scanned in this ADC hardware scan.
+    pub fn sample_now(&mut self, channel: Channel) -> Option<VoltageRange> {
+        assert_ne!(channel.as_channel_mask() & self.channels, 0);
+
+        let register = self.adc.dr[channel as usize].read();
+
+        if register.done().bit_is_set() {
+            Some(VoltageRange::from_raw(
+                register.v_vref().bits(),
+                self.accuracy,
+            ))
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for HardwareScan<'_> {
+    fn drop(&mut self) {
+        self.adc.cr.modify(|_, w| w.burst().swmode().start().stop());
+    }
+}
+
+impl core::fmt::Debug for HardwareScan<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        write!(f, "HardwareScan {{ /* device ADC peripheral */ }}")
+    }
+}
+
 /// A referred voltage range measured from the ADC peripheral.
 ///
-/// This type represents a range of voltages of the form:
+/// This type represents a range of voltages quantized by the ADC according to
+/// its maximum and configured accuracy. The minimum and maximum voltages are
+/// related to the ADC measurement as:
 ///
-/// ```text
-/// [Vdda * (N / B), Vdda * ((N + 1) / B)]
-/// ```
+/// `Vmin / Vref = Nmin / denominator`
 ///
-/// where B = 1024 for this ADC peripheral and N is the 10-bit
-/// ADC value measured. This type exposes N / B as a fraction.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+/// `Vmax / Vref = Nmax / denominator`
+///
+/// where Vref is the analog reference Vdd = Vdda. This type provides access to
+/// `Nmin`, `Nmax` and `denominator` in such a way that these values are simple
+/// to interpret. All measurements are proportional to `Vref` as shown above.
+///
+/// The lower the ADC accuracy setting, the larger `Nmax - Nmin` will be.
+#[derive(Clone, Copy, Debug)]
 pub struct VoltageRange(u16);
 
 impl VoltageRange {
-    /// The minimum measurable voltage range.
+    /// The voltage range corresponding to "near analog ground".
     #[inline]
-    pub const fn minimum() -> Self {
-        Self(0)
+    pub const fn ground(accuracy: Accuracy) -> Self {
+        Self::from_raw(0, accuracy)
     }
 
-    /// The maximum measurable voltage range.
+    /// Returns the raw measurement as obtained from the ADC.
     #[inline]
-    pub const fn maximum() -> Self {
-        Self(1023)
+    pub const fn into_raw(self) -> u16 {
+        self.0 & 0x3ff
     }
 
-    /// Returns the lower bound for the measured Vdda-referred voltage.
+    /// Returns the lower bound `Nmin` for this voltage range.
     #[inline]
-    pub const fn as_referred_voltage_lower_bound(self) -> (u16, u16) {
-        (self.0, 1024)
+    pub const fn lower_bound(self) -> u16 {
+        self.0 & 0x3ff
     }
 
-    /// Returns the upper bound for the measured Vdda-referred voltage.
+    /// Returns the upper bound `Nmax` for this voltage range.
     #[inline]
-    pub const fn as_referred_voltage_upper_bound(self) -> (u16, u16) {
-        (self.0 + 1, 1024)
+    pub const fn upper_bound(self) -> u16 {
+        (self.0 & 0x3ff) + (1 << (self.0 >> 10))
     }
 
-    fn from_adc(value: u16) -> Self {
-        Self(value)
+    /// Returns the midpoint of this voltage range.
+    ///
+    /// # Note
+    ///
+    /// For a 10-bit measurement, the midpoint is always rounded down to the
+    /// lower bound as the measured range is quantized to one 10-bit value.
+    #[inline]
+    pub const fn midpoint(self) -> u16 {
+        (self.0 & 0x3ff) + (1 << (self.0 >> 10)) / 2
+    }
+
+    /// Returns the denominator used to calculate referred voltages.
+    #[inline]
+    pub const fn denominator(self) -> u16 {
+        1024
+    }
+
+    #[inline]
+    const fn from_raw(value: u16, accuracy: Accuracy) -> Self {
+        let accuracy_bits = accuracy as u16; // ten bits == 0, three bits == 7
+        Self((value >> accuracy_bits << accuracy_bits) | (accuracy_bits << 10))
     }
 }
 
 struct MeasurementFuture;
 
-impl Drop for MeasurementFuture {
-    fn drop(&mut self) {
-        let adc = unsafe { &*ADCDevice::ptr() };
-
-        adc.inten.write(|w| w.adginten().clear_bit());
-        adc.cr.modify(|_, w| w.start().stop());
-    }
-}
-
 impl Future for MeasurementFuture {
-    type Output = &'static [u16; 8];
+    type Output = &'static [VoltageRange; 8];
 
     fn poll(self: Pin<&mut Self>, _: &mut Context) -> Poll<Self::Output> {
         let ctx = unsafe { &mut ADC_CTX };
 
-        if ctx.voltages_measured {
+        if let Status::Complete = ctx.status {
             Poll::Ready(&ctx.voltages)
         } else {
             Poll::Pending
@@ -218,14 +383,103 @@ impl Future for MeasurementFuture {
     }
 }
 
+enum Status {
+    Software(Channel),
+    Hardware(u8, Accuracy),
+    Complete,
+}
+
 struct AdcContext {
-    channel: Option<Channel>,
-    voltages_measured: bool,
-    voltages: [u16; 8],
+    voltages: [VoltageRange; 8],
+    status: Status,
 }
 
 static mut ADC_CTX: AdcContext = AdcContext {
-    voltages: [0; 8],
-    voltages_measured: false,
-    channel: None,
+    voltages: [VoltageRange::ground(Accuracy::TenBit); 8],
+    status: Status::Complete,
 };
+
+#[cfg(test)]
+mod tests {
+    use super::{Accuracy, VoltageRange};
+
+    #[test]
+    fn test_voltage_range_methods() {
+        assert_eq!(VoltageRange::ground(Accuracy::ThreeBit).lower_bound(), 0);
+        assert_eq!(VoltageRange::ground(Accuracy::ThreeBit).upper_bound(), 128);
+        assert_eq!(VoltageRange::ground(Accuracy::ThreeBit).midpoint(), 64);
+
+        assert_eq!(VoltageRange::ground(Accuracy::FourBit).lower_bound(), 0);
+        assert_eq!(VoltageRange::ground(Accuracy::FourBit).upper_bound(), 64);
+        assert_eq!(VoltageRange::ground(Accuracy::FourBit).midpoint(), 32);
+
+        assert_eq!(VoltageRange::ground(Accuracy::FiveBit).lower_bound(), 0);
+        assert_eq!(VoltageRange::ground(Accuracy::FiveBit).upper_bound(), 32);
+        assert_eq!(VoltageRange::ground(Accuracy::FiveBit).midpoint(), 16);
+
+        assert_eq!(VoltageRange::ground(Accuracy::SixBit).lower_bound(), 0);
+        assert_eq!(VoltageRange::ground(Accuracy::SixBit).upper_bound(), 16);
+        assert_eq!(VoltageRange::ground(Accuracy::SixBit).midpoint(), 8);
+
+        assert_eq!(VoltageRange::ground(Accuracy::SevenBit).lower_bound(), 0);
+        assert_eq!(VoltageRange::ground(Accuracy::SevenBit).upper_bound(), 8);
+        assert_eq!(VoltageRange::ground(Accuracy::SevenBit).midpoint(), 4);
+
+        assert_eq!(VoltageRange::ground(Accuracy::EightBit).lower_bound(), 0);
+        assert_eq!(VoltageRange::ground(Accuracy::EightBit).upper_bound(), 4);
+        assert_eq!(VoltageRange::ground(Accuracy::EightBit).midpoint(), 2);
+
+        assert_eq!(VoltageRange::ground(Accuracy::NineBit).lower_bound(), 0);
+        assert_eq!(VoltageRange::ground(Accuracy::NineBit).upper_bound(), 2);
+        assert_eq!(VoltageRange::ground(Accuracy::NineBit).midpoint(), 1);
+
+        assert_eq!(VoltageRange::ground(Accuracy::TenBit).lower_bound(), 0);
+        assert_eq!(VoltageRange::ground(Accuracy::TenBit).upper_bound(), 1);
+        assert_eq!(VoltageRange::ground(Accuracy::TenBit).midpoint(), 0);
+    }
+
+    #[test]
+    fn test_voltage_range_from_raw_into_raw() {
+        for raw in 0..1024 {
+            assert_eq!(
+                VoltageRange::from_raw(raw, Accuracy::TenBit).into_raw(),
+                raw
+            );
+
+            assert_eq!(
+                VoltageRange::from_raw(raw, Accuracy::NineBit).into_raw(),
+                raw & 0b11_1111_1110
+            );
+
+            assert_eq!(
+                VoltageRange::from_raw(raw, Accuracy::EightBit).into_raw(),
+                raw & 0b11_1111_1100
+            );
+
+            assert_eq!(
+                VoltageRange::from_raw(raw, Accuracy::SevenBit).into_raw(),
+                raw & 0b11_1111_1000
+            );
+
+            assert_eq!(
+                VoltageRange::from_raw(raw, Accuracy::SixBit).into_raw(),
+                raw & 0b11_1111_0000
+            );
+
+            assert_eq!(
+                VoltageRange::from_raw(raw, Accuracy::FiveBit).into_raw(),
+                raw & 0b11_1110_0000
+            );
+
+            assert_eq!(
+                VoltageRange::from_raw(raw, Accuracy::FourBit).into_raw(),
+                raw & 0b11_1100_0000
+            );
+
+            assert_eq!(
+                VoltageRange::from_raw(raw, Accuracy::ThreeBit).into_raw(),
+                raw & 0b11_1000_0000
+            );
+        }
+    }
+}
