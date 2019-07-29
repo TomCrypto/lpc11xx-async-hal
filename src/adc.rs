@@ -202,6 +202,11 @@ impl core::fmt::Debug for Driver {
     }
 }
 
+/// Wrapper type representing continous scanning mode.
+///
+/// The ADC peripheral can continously scan a set of ADC channels in hardware
+/// without disturbing the processor. The ADC channels may be sampled on the fly
+/// by the processor or interrupts can be selectively enabled for some channels.
 pub struct HardwareScan<'a> {
     adc: &'a ADCDevice,
     accuracy: Accuracy,
@@ -348,7 +353,7 @@ impl VoltageRange {
     /// # Note
     ///
     /// For a 10-bit measurement, the midpoint is always rounded down to the
-    /// lower bound as the measured range is quantized to one 10-bit value.
+    /// lower bound as the measured range is quantized to two 10-bit values.
     #[inline]
     pub const fn midpoint(self) -> u16 {
         (self.0 & 0x3ff) + (1 << (self.0 >> 10)) / 2
