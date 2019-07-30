@@ -5,4 +5,5 @@ pub use lpc11xx;
 
 pub mod adc;
 pub mod i2c;
+pub mod systick;
 pub mod uart;

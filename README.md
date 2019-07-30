@@ -52,6 +52,7 @@ Async drivers for the following peripherals are currently available:
 | UART               |                              | Autobaud, RS-485       |
 | I2C                | Slave Mode                   | Monitor Mode           |
 | ADC                | Timer Match                  |                        |
+| SysTick            |                              |                        |
 
 More are in development, contributions and suggestions welcome.
 

@@ -409,7 +409,7 @@ mod tests {
     use super::{Accuracy, VoltageRange};
 
     #[test]
-    fn test_voltage_range_methods() {
+    fn voltage_range_methods() {
         assert_eq!(VoltageRange::ground(Accuracy::ThreeBit).lower_bound(), 0);
         assert_eq!(VoltageRange::ground(Accuracy::ThreeBit).upper_bound(), 128);
         assert_eq!(VoltageRange::ground(Accuracy::ThreeBit).midpoint(), 64);
@@ -444,7 +444,7 @@ mod tests {
     }
 
     #[test]
-    fn test_voltage_range_from_raw_into_raw() {
+    fn voltage_range_from_raw_into_raw() {
         for raw in 0..1024 {
             assert_eq!(
                 VoltageRange::from_raw(raw, Accuracy::TenBit).into_raw(),

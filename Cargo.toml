@@ -1,7 +1,7 @@
 [package]
 name = "lpc11xx-async-hal"
 edition = "2018"
-version = "0.1.2"
+version = "0.1.3"
 authors = ["Thomas Bénéteau <thomas@bitwise.me>"]
 description = "Asynchronous HAL for the NXP LPC111x/LPC11Cxx/LPC11xxL/LPC11xxXL family of Cortex-M0 microcontrollers"
 documentation = "https://docs.rs/lpc11xx-async-hal"
@@ -11,6 +11,9 @@ readme = "README.md"
 categories = ["embedded", "hardware-support", "no-std"]
 keywords = ["arm", "cortex-m", "nxp", "async", "hal"]
 exclude = [".vscode/*"]
+
+[dependencies.cortex-m]
+version = "0.6.0"
 
 [dependencies.lpc11xx]
 version = "0.1.4"
